@@ -1,5 +1,32 @@
-model/__pycache__
-out
-website/
-docs-minimind-v/
-测试.py
+__pycache__/
+*.pyc
+*.pyo
+
+# Large model files
+model/qwen-0.5b/
+model/siglip2-base-p32-256-ve/
+model/*.safetensors
+model/*.bin
+
+# Large data files
+dataset/*.parquet
+dataset/.cache/
+
+# Checkpoints (too large)
+checkpoints/*resume*
+checkpoints/*.pth
+
+# Output
+out/
+*.log
+
+# SwanLab logs
+swanlog/
+
+# IDE
+.vscode/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

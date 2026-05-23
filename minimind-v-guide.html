@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiniMind-V: 从65M MiniMind 到 0.5B Qwen2.5 的完整迁移过程</title>
+<style>
+  :root { --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff; --border: #30363d; --code-bg: #161b22; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.6; max-width: 900px; margin: 0 auto; padding: 40px 20px; }
+  h1 { font-size: 2em; border-bottom: 2px solid var(--accent); padding-bottom: 10px; margin-bottom: 10px; }
+  h2 { font-size: 1.5em; color: var(--accent); margin: 30px 0 15px; }
+  h3 { font-size: 1.2em; margin: 20px 0 10px; }
+  p { margin: 10px 0; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 16px; overflow-x: auto; font-size: 0.9em; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.9em; }
+  ul, ol { padding-left: 24px; margin: 10px 0; }
+  li { margin: 5px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  .highlight { background: #1a3a2a; border-left: 3px solid #3fb950; padding: 10px 16px; margin: 15px 0; }
+  .bug { background: #3a1a1a; border-left: 3px solid #f85149; padding: 10px 16px; margin: 15px 0; }
+</style>
+</head>
+<body>
+
+<h1>MiniMind-V：从 65M MiniMind 到 0.5B Qwen2.5 的完整迁移</h1>
+<p style="color: #8b949e">Wu Zhangsen · 2026-05-23</p>
+
+<h2>1. 动机：为什么替换 LLM 骨架</h2>
+<p>原 MiniMind-V 的 LLM 骨架是 MiniMind 65M 参数模型。在纯文本测试中发现，该模型的语言能力非常有限：</p>
+<ul>
+  <li>无法识别草的颜色、太阳的形状等基础常识</li>
+  <li>回答经常偏移主题，生成质量不稳定</li>
+  <li>65M 参数的容量天花板限制了 VLM 的视觉-语言对齐上限</li>
+</ul>
+<p>相比之下，Qwen2.5-0.5B（494M 参数）经过大规模预训练，语言能力远超 MiniMind。将 LLM 从 65M 升级到 494M，预期可以显著提升 VLM 的识图准确率。</p>
+
+<h2>2. 架构对比</h2>
+<table>
+  <tr><th>组件</th><th>旧架构 (MiniMind-V)</th><th>新架构 (Qwen-VLM)</th></tr>
+  <tr><td>LLM</td><td>MiniMind 65M</td><td>Qwen2.5-0.5B (494M)</td></tr>
+  <tr><td>视觉编码器</td><td>SigLIP2 (冻结)</td><td>SigLIP2 (冻结，同)</td></tr>
+  <tr><td>Projector</td><td>768→768</td><td>768→1536→896 (扩展)</td></tr>
+  <tr><td>视觉-文本融合</td><td>token 替换 (count_vision_proj)</td><td>inputs_embeds 接口</td></tr>
+  <tr><td>Chat template</td><td>&lt;bos&gt;assistant</td><td>&lt;im_start&gt;assistant</td></tr>
+  <tr><td>图像标记</td><td>&lt;image&gt; 硬编码</td><td>&lt;image_pad&gt;×64</td></tr>
+</table>
+
+<h2>3. 三个关键设计决策</h2>
+
+<h3>3.1 Projector 扩展：768→1536→896</h3>
+<p>原 projector 是单层 Linear(768→768)，改为 2 层 MLP 加 GELU 激活：</p>
+<pre><code>MMVisionProjector:
+  LayerNorm(768)
+  → Linear(768, 1536) → GELU
+  → Linear(1536, 896)  # 896 = Qwen 的 hidden_size</code></pre>
+<p>扩展层让视觉特征有足够容量映射到 Qwen 的语义空间。</p>
+
+<h3>3.2 视觉嵌入融合：从 token 替换到 inputs_embeds</h3>
+<p>MiniMind 在 Transformer 层中手动替换 image token 的 hidden states。Qwen 方案直接在 embedding 层做替换：</p>
+<pre><code>text_embeds = llm.get_input_embeddings()(input_ids)
+vision_embeds = siglip(pixel_values) → projector
+text_embeds = splice(text_embeds, input_ids, vision_embeds)
+outputs = llm(inputs_embeds=text_embeds, ...)</code></pre>
+<p>优点：Qwen LLM 本身不需要任何修改，标准 HuggingFace 接口。</p>
+
+<h3>3.3 Label 生成：基于 chat template 结构</h3>
+<p>MiniMind 用 token 模式匹配（找 &lt;bos&gt;assistant）来定位 assistant 回复位置。Qwen 的 template 不同，改为用 chat template 结构自动计算 prefix 长度：</p>
+<pre><code>prefix_convs = [c for c in conversations if c['role'] != 'assistant']
+prefix_prompt = apply_chat_template(prefix_convs, add_generation_prompt=True)
+prefix_len = len(tokenizer(prefix_prompt).input_ids)
+labels = [-100] * prefix_len + input_ids[prefix_len:]</code></pre>
+
+<h2>4. 训练流程</h2>
+<table>
+  <tr><th>阶段</th><th>脚本</th><th>训练参数</th><th>LR</th><th>BS</th><th>时间</th></tr>
+  <tr><td>Pretrain E1</td><td>train_pretrain_qwen.py</td><td>projector (2.6M)</td><td>4e-4</td><td>8</td><td>~3h</td></tr>
+  <tr><td>Pretrain E2</td><td>train_pretrain_qwen.py</td><td>projector (2.6M)</td><td>4e-4</td><td>8</td><td>~3h</td></tr>
+  <tr><td>SFT E1</td><td>train_sft_qwen.py</td><td>projector + LoRA (4.7M)</td><td>5e-6</td><td>8</td><td>~5h</td></tr>
+  <tr><td>SFT E2</td><td>train_sft_qwen.py</td><td>projector + LoRA (4.7M)</td><td>5e-6</td><td>8</td><td>~5h</td></tr>
+</table>
+<p>GPU: RTX 5070 12GB。数据: sft_i2t.parquet (50万条图文对话，取 17.2%)。</p>
+
+<h2>5. 6 个 Bug 记录</h2>
+
+<div class="bug">
+<h3>Bug #1: Label 对不齐 (loss=NaN, no grad_fn)</h3>
+<p>原因: MiniMind 的 &lt;bos&gt;assistant 模式匹配在 Qwen template 下失效，全部 labels = -100。</p>
+<p>修复: 用 chat template 结构计算 prefix_len（_get_prefix_len 方法）。</p>
+</div>
+
+<div class="bug">
+<h3>Bug #2: Vision features 5D 维度</h3>
+<p>原因: Dataset collate 产生 [B, N, C, H, W]，SigLIP 期望 [B, C, H, W]。</p>
+<p>修复: get_vision_features 中检测 dim==5，flatten 处理。</p>
+</div>
+
+<div class="bug">
+<h3>Bug #3: save_dir 路径解析</h3>
+<p>原因: init_qwen_vlm 的 save_dir='../out' 相对 CWD，未像 llm_path 那样用 proj_root 解析。</p>
+<p>修复: 添加 if not isabs: save_dir = join(proj_root, save_dir.lstrip('./'))。</p>
+</div>
+
+<div class="bug">
+<h3>Bug #4: cannot pickle 'module' object</h3>
+<p>原因: qwen_vlm_checkpoint 遍历 **kwargs 时把 swanlab 模块写入 resume_data，无法序列化。</p>
+<p>修复: 过滤 ModuleType 和 FunctionType。</p>
+</div>
+
+<div class="bug">
+<h3>Bug #5: _get_prefix_len 未替换 image 标记</h3>
+<p>原因: 旧代码先用 create_chat_prompt（替换了 &lt;image&gt;），随后被 apply_chat_template（未替换）覆盖。</p>
+<p>修复: 在 apply_chat_template 前手动替换 prefix_convs 中的 &lt;image&gt;。训练 checkpoint 需重跑。</p>
+</div>
+
+<div class="bug">
+<h3>Bug #6: OOM Killer (WSL2 内存耗尽)</h3>
+<p>原因: num_workers=4 × 17GB/fork，加主进程 19GB，超过 WSL2 内存限制。</p>
+<p>修复: num_workers 降到 2，checkpoint 完整，续训恢复。</p>
+</div>
+
+<h2>6. LoRA 配置</h2>
+<table>
+  <tr><th>参数</th><th>值</th></tr>
+  <tr><td>rank (r)</td><td>16</td></tr>
+  <tr><td>alpha</td><td>32</td></tr>
+  <tr><td>dropout</td><td>0.05</td></tr>
+  <tr><td>目标模块</td><td>q_proj, k_proj, v_proj, o_proj</td></tr>
+  <tr><td>可训练参数</td><td>Projector 2.56M + LoRA 2.16M = 4.72M</td></tr>
+  <tr><td>冻结参数</td><td>~588M (基座 LLM + embedding + vision encoder)</td></tr>
+</table>
+
+<h2>7. 评测结果</h2>
+<table>
+  <tr><th>阶段</th><th>金毛+气球</th><th>彩虹伞</th><th>樱花自行车</th><th>黄色跑车</th><th>超人屋顶</th><th>赛车漂移</th></tr>
+  <tr><td>Pretrain E1</td><td>漏气球、"毛衣"</td><td>"黑色伞"</td><td>"山地自行车"</td><td>基础描述</td><td>"任务"</td><td>"红色风扇"</td></tr>
+  <tr><td>Pretrain E2</td><td>识别出气球</td><td>多色描述</td><td>"浪漫"+"玫瑰花"幻觉</td><td>"水面行驶"幻觉</td><td>"长剑"幻觉</td><td>观众识别</td></tr>
+  <tr><td>SFT LoRA E1</td><td>✅ 气球颜色列举</td><td>✅ 去除水面幻觉</td><td>✅ 自然描述</td><td>✅ 去水面+精准</td><td>✅ 超人正确</td><td>✅ 比赛氛围</td></tr>
+</table>
+
+<h2>8. 未来方向</h2>
+<ul>
+  <li>更大规模预训练数据（当前仅 50 万条）</li>
+  <li>更长的 max_seq_len (256→512) 提升长文本理解</li>
+  <li>多图对话支持</li>
+  <li>RLHF/DPO 对齐优化</li>
+  <li>量化部署 (GGUF/AWQ) 适配边缘设备</li>
+</ul>
+
+</body>
+</html>

@@ -64,7 +64,12 @@ def setup_seed(seed: int):
 
 
 def init_vlm_model(vlm_config, from_weight='pretrain_vlm', tokenizer_path='../model', vision_model_path='../model/siglip2-base-p32-256-ve', save_dir='../out', device='cuda', freeze_llm=0):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # 转换为绝对路径
+    if not os.path.isabs(tokenizer_path):
+        tokenizer_path = os.path.abspath(os.path.join(os.path.dirname(__file__), tokenizer_path))
+    if not os.path.isabs(vision_model_path):
+        vision_model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), vision_model_path))
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
     model = MiniMindVLM(vlm_config, vision_model_path=vision_model_path)
     
     if from_weight != 'none':
@@ -140,7 +145,7 @@ def vlm_checkpoint(vlm_config, weight='pretrain_vlm', model=None, optimizer=None
         
         resume_tmp = resume_path + '.tmp'
         torch.save(resume_data, resume_tmp)
-        os.replace(resume_tmp, resume_path)
+        os.replace(resume_tmp,resume_path )
         del state_dict, clean_state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式

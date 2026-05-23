@@ -52,8 +52,15 @@ class VLMDataset(Dataset):
         self.max_length = max_length
         self.preprocess = preprocess
         self.image_special_token = image_special_token * image_token_len
-        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+
+        # Qwen uses <|im_start|>assistant\n, MiniMind uses <|bos|>assistant\n
+        if tokenizer.bos_token is None:
+            # Qwen-style tokenizer
+            self.bos_id = self.tokenizer.encode('\n<|im_start|>assistant\n', add_special_tokens=False)
+            self.eos_id = self.tokenizer.encode('<|im_end|>\n', add_special_tokens=False)
+        else:
+            self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+            self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
     def __len__(self):
         return len(self.table)
@@ -71,35 +78,45 @@ class VLMDataset(Dataset):
             tools=tools
         )
 
-    def generate_labels(self, input_ids):
-        labels = [-100] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
-                    labels[j] = input_ids[j]
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
-        return labels
+    def _get_prefix_len(self, conversations):
+        """Get token count of everything before the last assistant response."""
+        prefix_convs = [c for c in conversations if c.get('role') != 'assistant']
+        if not prefix_convs:
+            return 0
+        # Replace <image> placeholder with pad tokens in prefix conversations
+        prefix_convs = [
+            {**c, 'content': c['content'].replace('<image>', self.image_special_token)}
+            if c.get('role') != 'system' else c
+            for c in prefix_convs
+        ]
+        tools = conversations[0]["functions"] if (conversations and conversations[0]["role"] == "system" and conversations[0].get("functions")) else None
+        prefix_prompt = self.tokenizer.apply_chat_template(
+            prefix_convs, tokenize=False, add_generation_prompt=True, tools=tools
+        )
+        prefix_prompt = post_processing_chat(prefix_prompt)
+        return len(self.tokenizer(prefix_prompt).input_ids)
 
     def __getitem__(self, index: int):
         conversations = json.loads(self.table['conversations'][index].as_py())
         image_bytes = self.table['image_bytes'][index].as_py()
         if not isinstance(image_bytes, list): image_bytes = [image_bytes]
-        
+
         conversations = pre_processing_chat(conversations)
         prompt = self.create_chat_prompt(conversations)
         prompt = post_processing_chat(prompt)
-        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
-        labels = self.generate_labels(input_ids)
+
+        # Tokenize full conversation
+        full_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        prefix_len = self._get_prefix_len(conversations)
+
+        # Labels: -100 for prompt prefix, copy input_ids for assistant response
+        labels = [-100] * min(prefix_len, self.max_length)
+        response_ids = full_ids[prefix_len:self.max_length]
+        labels += response_ids
+
+        # Pad to max_length
+        input_ids = full_ids + [self.tokenizer.pad_token_id] * (self.max_length - len(full_ids))
+        labels = (labels + [-100] * (self.max_length - len(labels)))[:self.max_length]
 
         image_inputs_list = [MiniMindVLM.image2tensor(Image.open(io.BytesIO(img)), self.preprocess) for img in image_bytes]
         if hasattr(image_inputs_list[0], 'keys'):
